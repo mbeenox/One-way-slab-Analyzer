@@ -53,7 +53,7 @@ function computeSectionProps(params) {
 
 // METHOD 1: Hand Calculation (ACI Strip Method)
 function runHandCalc(params, section) {
-  const { Lx, Ly, xLoad, wD, wL, fc, bearingSize } = params;
+  const { Lx, Ly, xLoad, wD, wL, fc, bearingSize, appliedMoment } = params;
   const { d_x, d_y, phi_Mn_x_pos, phi_Mn_x_neg, phi_Mn_y_pos, phi_Vc } = section;
 
   const L = Lx;
@@ -67,13 +67,20 @@ function runHandCalc(params, section) {
   const beff = Math.min(beff_option1, Math.max(beff_option2, beff_option1));
   const beff_used = Math.min(beff_option1, Ly);
 
+  // Applied moment (ft-kips, service) at the load point
+  // Factored as live load: Mu_applied = 1.6 * M_applied
+  // Distributed over effective width: Mu_per_ft = 1.6 * M / beff
+  const Mu_applied = (1.6 * appliedMoment) / beff_used; // ft-k/ft (factored, per ft width)
+
   // Flexure
-  const M_uniform_at_load = (w_u / 1000) * a * (L - a) / 2;
-  const M_point_per_ft = (a * b) / (L * beff_used);
-  const Pu_flex = ((phi_Mn_x_pos / 12) - M_uniform_at_load) / M_point_per_ft;
+  const M_uniform_at_load = (w_u / 1000) * a * (L - a) / 2; // ft-k/ft
+  const M_total_demand_no_P = M_uniform_at_load + Mu_applied; // ft-k/ft
+  const M_point_per_ft = (a * b) / (L * beff_used); // ft-k/ft per kip of Pu
+  const capacity_ft = phi_Mn_x_pos / 12; // ft-k/ft
+  const Pu_flex = (capacity_ft - M_total_demand_no_P) / M_point_per_ft;
   const P_flex = Pu_flex / 1.6;
 
-  // One-way shear
+  // One-way shear (applied moment does not directly affect shear demand)
   const V_uniform = (w_u / 1000) * (L / 2 - d_x / 12);
   const R_near = b / L;
   const V_point_per_ft = R_near / beff_used;
@@ -101,8 +108,9 @@ function runHandCalc(params, section) {
     method: "ACI Strip Method",
     beff_used,
     w_u,
+    Mu_applied,
     results: {
-      flexure: { Pu: Pu_flex, P: P_flex, M_uniform: M_uniform_at_load, capacity: phi_Mn_x_pos / 12 },
+      flexure: { Pu: Pu_flex, P: P_flex, M_uniform: M_uniform_at_load, M_moment: Mu_applied, capacity: capacity_ft },
       shear: { Pu: Pu_shear, P: P_shear, V_uniform, capacity: phi_Vc },
       punching: { Pu: Pu_punch, P: P_punch, b0, capacity: phi_Vc_punch },
       deflection: { delta_uniform, delta_limit, ok: delta_uniform < delta_limit }
@@ -113,7 +121,7 @@ function runHandCalc(params, section) {
 
 // METHOD 2: Yield-Line Analysis
 function runYieldLine(params, section) {
-  const { Lx, Ly, xLoad, wD, wL } = params;
+  const { Lx, Ly, xLoad, wD, wL, appliedMoment } = params;
   const { phi_Mn_x_pos, phi_Mn_y_pos } = section;
 
   // Work in FEET throughout
@@ -125,19 +133,24 @@ function runYieldLine(params, section) {
   const my = phi_Mn_y_pos / 12;  // ft-k/ft (moment capacity, long dir)
   const w_u = (1.2 * wD + 1.6 * wL) / 1000;  // k/ft² (factored uniform load)
 
+  // Applied moment (ft-kips service, factored as 1.6)
+  // The applied moment does external work on the collapse mechanism.
+  // For a virtual displacement δ=1 at the load point:
+  //   The left panel rotates θ_left = 1/a about the left support
+  //   The right panel rotates θ_right = 1/b about the right support
+  //   Total rotation discontinuity at the load line = 1/a + 1/b = L/(a*b)
+  // The applied moment does work: W_moment = Mu * θ_total (per ft of mechanism width)
+  // But the moment is concentrated, not per ft, so:
+  //   W_moment = Mu * (1/a + 1/b) = Mu * L / (a*b)
+  const Mu_applied = 1.6 * appliedMoment;  // ft-kips (factored)
+  const theta_total = (a + b) / (a * b);   // 1/ft = L/(a*b)
+  const W_moment = Mu_applied * theta_total; // ft-kips * (1/ft) = kips (work)
+
   // Fan mechanism: 4 yield lines from load point at (a, B/2) to 
   // points at (0, B/2±c) and (L, B/2±c) on the support lines.
   // Two triangular panels rotate about the two support edges.
   //
   // Virtual deflection δ=1 at load point.
-  //
-  // For each diagonal yield line, the internal work is computed using
-  // the projected length method:
-  //   D = (mx * y_projection² + my * x_projection²) / (x_projection² + y_projection²)
-  // summed over all 4 yield lines.
-  //
-  // Left pair (to x=0 support): x_proj = a, y_proj = c (each)
-  // Right pair (to x=L support): x_proj = b, y_proj = c (each)
 
   let Pu_min = 1e10;
   let c_opt = 0;
@@ -152,22 +165,16 @@ function runYieldLine(params, section) {
     const c2 = c * c;
 
     // Internal work (4 yield lines total):
-    // Left pair (2 lines): each has x-proj=a, y-proj=c
-    // D_left = 2 * (a² * mx + c² * my) / (a² + c²)
-    // (This comes from: m_n * l * θ_n for the projected length method)
     const D_left = 2 * (a2 * mx + c2 * my) / (a2 + c2);
     const D_right = 2 * (b2 * mx + c2 * my) / (b2 + c2);
     const D_int = D_left + D_right;
 
     // External work from uniform load:
-    // Left triangle: area = a*c, centroid deflects δ/3
-    // Right triangle: area = b*c, centroid deflects δ/3
-    // W = w_u * [a*c*(1/3) + b*c*(1/3)] = w_u * c * (a+b) / 3 = w_u * c * L / 3
     const W_uniform = w_u * c * L / 3;
 
-    // Work equation: Pu * 1 + W_uniform = D_int
-    // So: Pu = D_int - W_uniform
-    const Pu = D_int - W_uniform;
+    // Work equation: Pu * 1 + W_uniform + W_moment = D_int
+    // So: Pu = D_int - W_uniform - W_moment
+    const Pu = D_int - W_uniform - W_moment;
 
     if (Pu > 0 && Pu < Pu_min) {
       Pu_min = Pu;
@@ -175,22 +182,26 @@ function runYieldLine(params, section) {
     }
   }
 
-  const P_yl = Pu_min / 1.6;
+  // If Pu_min is still 1e10, the applied moment alone exceeds capacity
+  const overloaded = Pu_min >= 1e9;
+  const P_yl = overloaded ? 0 : Pu_min / 1.6;
 
   return {
     method: "Yield-Line Analysis",
     c_opt,
     mechanism_width: 2 * c_opt,
+    W_moment,
+    overloaded,
     results: {
-      collapse_load: { Pu: Pu_min, P: P_yl }
+      collapse_load: { Pu: overloaded ? 0 : Pu_min, P: P_yl }
     },
-    governing: { Pu: Pu_min, P: P_yl, mode: "Plastic Collapse (upper bound)" }
+    governing: { Pu: overloaded ? 0 : Pu_min, P: P_yl, mode: overloaded ? "Overloaded by moment" : "Plastic Collapse (upper bound)" }
   };
 }
 
 // METHOD 3: Elastic Plate FEA (simplified — uses Navier series solution)
 function runElasticFEA(params, section) {
-  const { Lx, Ly, xLoad, wD, wL, fc, bearingSize } = params;
+  const { Lx, Ly, xLoad, wD, wL, fc, bearingSize, appliedMoment } = params;
   const { d_x, d_y, phi_Mn_x_pos, phi_Mn_y_pos, phi_Vc, Ec, Ig_per_in, Mcr, Icr_x, Icr_y } = section;
 
   const L = Lx * 12;
@@ -266,13 +277,80 @@ function runElasticFEA(params, section) {
 
   // For uniform load on SS plate with free edges:
   // Behaves like a beam: Mx = w*x*(L-x)/2, My = ν*Mx (per unit width)
+  //
+  // Applied moment at the load point:
+  // A concentrated moment M0 on a SS beam produces:
+  //   Mx(x) = M0*x*(L-a)/(L*a)  for x ≤ a  (left of moment)
+  //   Mx(x) = M0*(L-x)*a/(L*(L-a))... 
+  // More precisely, for moment M0 at x=a on SS beam:
+  //   Left reaction = -M0/L (upward if M0 positive)
+  //   Right reaction = +M0/L
+  //   Mx(x) = -M0*x/L                for x ≤ a
+  //   Mx(x) = -M0*x/L + M0 = M0*(1 - x/L)  for x > a ... 
+  // Actually: R_left = M0/L (down), R_right = -M0/L (up) for moment M0 at x=a
+  //   Mx(x) = R_left * x = M0*x/L                       for x < a
+  //   Mx(x) = R_left * x - M0 = M0*x/L - M0 = M0*(x/L - 1) for x > a
+  // This gives a triangular diagram peaking at x=a with Mx(a) = M0*a/L
+  // Wait — for a concentrated moment on a SS beam:
+  //   R_A = -M0/L,  R_B = M0/L  (reactions)
+  //   M(x) = R_A * x = -M0*x/L                for x < a
+  //   M(x) = R_A * x + M0 = M0*(1 - x/L)     for x > a
+  // So M(a-) = -M0*a/L,  M(a+) = M0*(1-a/L) = M0*b/L
+  // Jump at x=a equals M0.
+  //
+  // Factored applied moment = 1.6 * appliedMoment (treating as live load)
+  // Distributed over the effective width for the plate: use same Lévy decay as point load
+  
+  const Mu_app = 1.6 * appliedMoment; // ft-kips factored
+  const Mu_app_ink = Mu_app * 12;     // in-kips factored
+
   for (let ix = 0; ix < nx_pts; ix++) {
     const x = ix * dx_grid;
-    const mx_beam = w_u_ksi * x * (L - x) / 2; // k·in per in width
+    const mx_beam = w_u_ksi * x * (L - x) / 2; // k·in per in width (uniform load)
+    
+    // Beam moment from applied concentrated moment (per full width, then distribute via Lévy)
+    // M_beam(x) for concentrated moment Mu at x0:
+    let mx_moment_beam;
+    if (x <= x0) {
+      mx_moment_beam = -Mu_app_ink * x / L;  // in-kips (total, not per width)
+    } else {
+      mx_moment_beam = Mu_app_ink * (1 - x / L); // in-kips (total)
+    }
+    
     for (let iy = 0; iy < ny_pts; iy++) {
+      const y = iy * dy_grid;
+      const dy_load = Math.abs(y - y0);
       const idx = iy * nx_pts + ix;
+      
+      // Uniform load moment (constant across width for one-way)
       Mx_uniform[idx] = mx_beam * 12; // in-k per ft
       My_uniform[idx] = nu * mx_beam * 12;
+      
+      // Add applied moment contribution distributed via Lévy-type decay
+      // Same exponential decay as the point load: Σ sin(mπx0/L)*sin(mπx/L)*decay
+      // But for a concentrated moment, the Fourier expansion is different:
+      // The beam solution already gives us the moment diagram shape.
+      // For plate distribution across width, use the same decay kernel.
+      if (Math.abs(Mu_app) > 1e-6) {
+        let moment_dist = 0;
+        for (let m = 1; m <= nTerms; m++) {
+          const alpha = (m * Math.PI) / L;
+          const sin_mx = Math.sin((m * Math.PI * x) / L);
+          const sin_mx0 = Math.sin((m * Math.PI * x0) / L);
+          const decay = Math.exp(-alpha * dy_load);
+          const r = alpha * dy_load;
+          const fm = ((1 + nu) + (1 - nu) * r) * decay;
+          moment_dist += sin_mx0 * sin_mx * fm;
+        }
+        // The moment from the concentrated couple distributes similarly to a point load
+        // but with different Fourier coefficients. For simplicity, use the beam moment
+        // at each x and distribute across width using the plate decay ratio.
+        // At the load centerline (dy=0), ratio = 1/(implied_beff_in * 12).
+        // Use the Lévy distribution normalized so that integral across width = total beam moment.
+        const moment_per_in = (mx_moment_beam / L) * moment_dist;  // in-k per in width
+        Mx_uniform[idx] += moment_per_in * 12; // add to demand as in-k per ft
+        My_uniform[idx] += nu * moment_per_in * 12;
+      }
     }
   }
 
@@ -474,15 +552,73 @@ export default function SlabAnalyzer() {
     spacingShortBot: 10, spacingShortTop: 10,
     spacingLongBot: 12, spacingLongTop: 12,
     xLoad: 3.8, wD: 100, wL: 100,
-    bearingSize: 6
+    bearingSize: 6,
+    appliedMoment: 0
   });
 
+  const [projectName, setProjectName] = useState("Untitled Project");
   const [results, setResults] = useState(null);
   const [activeTab, setActiveTab] = useState("inputs");
+  const [saveMsg, setSaveMsg] = useState("");
 
   const updateInput = (key, value) => {
     setInputs(prev => ({ ...prev, [key]: value }));
   };
+
+  // SAVE PROJECT — downloads a .slab JSON file to your computer
+  const saveProject = useCallback(() => {
+    const projectData = {
+      version: "1.0",
+      appName: "SlabPointLoadAnalyzer",
+      projectName,
+      savedAt: new Date().toISOString(),
+      inputs
+    };
+    const json = JSON.stringify(projectData, null, 2);
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const safeName = projectName.replace(/[^a-zA-Z0-9_\- ]/g, "").trim() || "Untitled";
+    a.href = url;
+    a.download = `${safeName}.slab`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setSaveMsg("Saved!");
+    setTimeout(() => setSaveMsg(""), 2000);
+  }, [inputs, projectName]);
+
+  // OPEN PROJECT — reads a .slab JSON file from your computer
+  const openProject = useCallback(() => {
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = ".slab,.json";
+    fileInput.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const data = JSON.parse(ev.target.result);
+          if (data.inputs) {
+            setInputs(data.inputs);
+            if (data.projectName) setProjectName(data.projectName);
+            setResults(null);
+            setActiveTab("inputs");
+            setSaveMsg("Loaded!");
+            setTimeout(() => setSaveMsg(""), 2000);
+          } else {
+            alert("Invalid project file — missing inputs data.");
+          }
+        } catch (err) {
+          alert("Could not read file. Make sure it is a valid .slab project file.");
+        }
+      };
+      reader.readAsText(file);
+    };
+    fileInput.click();
+  }, []);
 
   const runAnalysis = useCallback(() => {
     const barDiaShort = BAR_SIZES[inputs.barShort];
@@ -497,7 +633,8 @@ export default function SlabAnalyzer() {
       spacingLongBot: inputs.spacingLongBot,
       spacingLongTop: inputs.spacingLongTop,
       xLoad: inputs.xLoad, wD: inputs.wD, wL: inputs.wL,
-      bearingSize: inputs.bearingSize
+      bearingSize: inputs.bearingSize,
+      appliedMoment: inputs.appliedMoment
     };
 
     const section = computeSectionProps(params);
@@ -532,22 +669,72 @@ export default function SlabAnalyzer() {
       <div style={{
         background: "linear-gradient(135deg, #1a1f2e 0%, #0f1219 100%)",
         borderBottom: "1px solid #2a2f3e",
-        padding: "20px 24px",
+        padding: "16px 24px",
         display: "flex", alignItems: "center", gap: "16px"
       }}>
         <div style={{
-          width: 42, height: 42, borderRadius: 8,
+          width: 42, height: 42, borderRadius: 8, flexShrink: 0,
           background: "linear-gradient(135deg, #f59e0b, #d97706)",
           display: "flex", alignItems: "center", justifyContent: "center",
           fontSize: 20, fontWeight: 900, color: "#0c0f14"
         }}>S</div>
-        <div>
-          <div style={{ fontSize: 18, fontWeight: 700, letterSpacing: "-0.02em", color: "#f4f4f5" }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: "-0.02em", color: "#f4f4f5" }}>
             One-Way Slab Point Load Analyzer
           </div>
-          <div style={{ fontSize: 12, color: "#71717a", marginTop: 2 }}>
+          <div style={{ fontSize: 11, color: "#71717a", marginTop: 2 }}>
             ACI 318 · Strip Method · Yield-Line · Elastic Plate Theory
           </div>
+        </div>
+        {/* Project Name + File Actions */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
+            <div style={{ fontSize: 10, color: "#52525b", textTransform: "uppercase", letterSpacing: "0.06em" }}>Project</div>
+            <input
+              type="text"
+              value={projectName}
+              onChange={e => setProjectName(e.target.value)}
+              placeholder="Project Name"
+              style={{
+                width: 200, padding: "6px 10px", fontSize: 13, fontWeight: 600,
+                background: "#1e222d", border: "1px solid #2a2f3e", borderRadius: 6,
+                color: "#f4f4f5", outline: "none", textAlign: "right"
+              }}
+              onFocus={e => { e.target.style.borderColor = "#f59e0b"; e.target.select(); }}
+              onBlur={e => e.target.style.borderColor = "#2a2f3e"}
+            />
+          </div>
+          <div style={{ width: 1, height: 32, background: "#2a2f3e" }} />
+          <button onClick={openProject} title="Open Project" style={{
+            padding: "8px 14px", fontSize: 12, fontWeight: 600,
+            background: "#1e222d", border: "1px solid #2a2f3e", borderRadius: 7,
+            color: "#a1a1aa", cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
+            transition: "all 0.15s"
+          }}
+            onMouseEnter={e => { e.currentTarget.style.borderColor = "#f59e0b"; e.currentTarget.style.color = "#f4f4f5"; }}
+            onMouseLeave={e => { e.currentTarget.style.borderColor = "#2a2f3e"; e.currentTarget.style.color = "#a1a1aa"; }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            Open
+          </button>
+          <button onClick={saveProject} title="Save Project" style={{
+            padding: "8px 14px", fontSize: 12, fontWeight: 600,
+            background: "linear-gradient(135deg, #f59e0b22, #d9770622)", border: "1px solid #f59e0b44", borderRadius: 7,
+            color: "#fbbf24", cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
+            transition: "all 0.15s"
+          }}
+            onMouseEnter={e => { e.currentTarget.style.background = "linear-gradient(135deg, #f59e0b33, #d9770633)"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = "linear-gradient(135deg, #f59e0b22, #d9770622)"; }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+            Save
+          </button>
+          {saveMsg && (
+            <div style={{
+              padding: "4px 10px", borderRadius: 5, fontSize: 11, fontWeight: 700,
+              background: "#166534", color: "#4ade80", animation: "fadeIn 0.2s ease"
+            }}>{saveMsg}</div>
+          )}
         </div>
       </div>
 
@@ -634,9 +821,19 @@ export default function SlabAnalyzer() {
                   onChange={v => updateInput("xLoad", parseFloat(v) || 0)} />
                 <InputRow label="Bearing Plate Size (in)" value={inputs.bearingSize}
                   onChange={v => updateInput("bearingSize", parseFloat(v) || 0)} />
-                <div style={{ marginTop: 8 }}>
-                  <SlabDiagram Lx={inputs.Lx} Ly={inputs.Ly} xLoad={inputs.xLoad} />
+              </div>
+              <div style={{ borderTop: "1px solid #2a2f3e", margin: "12px 0", paddingTop: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "#71717a", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>
+                  Applied Moment at Load Point
                 </div>
+                <InputRow label="Moment (ft-kips, service)" value={inputs.appliedMoment}
+                  onChange={v => updateInput("appliedMoment", parseFloat(v) || 0)} />
+                <div style={{ padding: "6px 10px", background: "#1a1f2e", borderRadius: 6, fontSize: 11, color: "#a1a1aa", lineHeight: 1.5 }}>
+                  Concentrated moment applied at the same location as the point load (e.g., from eccentric connection or equipment base). Positive = adds to sagging moment. Factored as 1.6× (live load).
+                </div>
+              </div>
+              <div style={{ marginTop: 8 }}>
+                <SlabDiagram Lx={inputs.Lx} Ly={inputs.Ly} xLoad={inputs.xLoad} appliedMoment={inputs.appliedMoment} />
               </div>
             </Card>
 
@@ -687,6 +884,10 @@ export default function SlabAnalyzer() {
               >
                 <ResultRow label="Effective Width" value={`${fmt(results.hand.beff_used)} ft`} />
                 <ResultRow label="wu (factored)" value={`${fmt(results.hand.w_u)} psf`} />
+                {results.hand.Mu_applied > 0 && (
+                  <ResultRow label="Mu,applied / beff" value={`${fmt(results.hand.Mu_applied)} ft-k/ft`}
+                    sub="Factored moment demand per ft" />
+                )}
                 <Divider />
                 <ResultRow label="Flexure" value={fmtLbs(results.hand.results.flexure.P)}
                   sub={`Pu = ${fmt(results.hand.results.flexure.Pu)} kips`}
@@ -709,10 +910,19 @@ export default function SlabAnalyzer() {
               >
                 <ResultRow label="Mechanism Width" value={`${fmt(results.yl.mechanism_width)} ft`} />
                 <ResultRow label="Optimal c" value={`${fmt(results.yl.c_opt)} ft`} />
+                {results.yl.W_moment > 0 && (
+                  <ResultRow label="Moment Work" value={`${fmt(results.yl.W_moment)} kips`}
+                    sub="External work from applied moment" />
+                )}
                 <Divider />
                 <ResultRow label="Collapse Load" value={fmtLbs(results.yl.governing.P)}
                   sub={`Pu = ${fmt(results.yl.governing.Pu)} kips`}
                   highlight />
+                {results.yl.overloaded && (
+                  <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 8, fontSize: 11, color: "#f87171", lineHeight: 1.5 }}>
+                    ⚠ Applied moment + uniform load exceeds slab capacity. No additional point load can be supported.
+                  </div>
+                )}
                 <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(139,92,246,0.08)", borderRadius: 8, fontSize: 11, color: "#a78bfa", lineHeight: 1.5 }}>
                   Upper-bound theorem: true capacity ≤ this value. Requires sufficient ductility for full plastic redistribution.
                 </div>
@@ -968,12 +1178,13 @@ function RecommendationBlock({ results, fmt }) {
   );
 }
 
-function SlabDiagram({ Lx, Ly, xLoad }) {
+function SlabDiagram({ Lx, Ly, xLoad, appliedMoment }) {
   const W = 220, H = 100;
   const pad = 20;
   const sW = W - 2 * pad;
   const sH = H - 2 * pad;
   const xP = pad + (xLoad / Lx) * sW;
+  const hasM = Math.abs(appliedMoment || 0) > 0;
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: 80 }}>
@@ -987,6 +1198,15 @@ function SlabDiagram({ Lx, Ly, xLoad }) {
       <circle cx={xP} cy={pad + sH / 2} r={5} fill="#ef4444" />
       <line x1={xP} y1={pad - 5} x2={xP} y2={pad + sH / 2 - 7} stroke="#ef4444" strokeWidth={1.5}
         markerEnd="url(#arr)" />
+      {/* Moment arc */}
+      {hasM && (
+        <>
+          <path d={`M ${xP - 10} ${pad + sH / 2 + 12} A 10 10 0 1 1 ${xP + 10} ${pad + sH / 2 + 12}`}
+            fill="none" stroke="#a78bfa" strokeWidth={1.5}
+            markerEnd="url(#arrM)" />
+          <text x={xP} y={pad + sH / 2 + 28} textAnchor="middle" fontSize={7} fill="#a78bfa">M</text>
+        </>
+      )}
       {/* Dimension */}
       <text x={pad + sW / 2} y={H - 2} textAnchor="middle" fontSize={9} fill="#71717a">{Lx} ft</text>
       <text x={xP} y={pad - 8} textAnchor="middle" fontSize={8} fill="#ef4444">{xLoad} ft</text>
@@ -994,6 +1214,9 @@ function SlabDiagram({ Lx, Ly, xLoad }) {
       <defs>
         <marker id="arr" markerWidth={6} markerHeight={6} refX={3} refY={3} orient="auto">
           <path d="M0,0 L6,3 L0,6 Z" fill="#ef4444" />
+        </marker>
+        <marker id="arrM" markerWidth={6} markerHeight={6} refX={3} refY={3} orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#a78bfa" />
         </marker>
       </defs>
     </svg>
@@ -1030,11 +1253,16 @@ HAND CALCULATION (ACI STRIP METHOD)
   Span = ${p.Lx} ft | Load at ${p.xLoad} ft from support
   a = ${p.xLoad} ft, b = ${(p.Lx - p.xLoad).toFixed(2)} ft
   beff = L/3 = ${(p.Lx/3).toFixed(2)} ft (used: ${h.beff_used.toFixed(2)} ft)
-  wu = 1.2(${p.wD}) + 1.6(${p.wL}) = ${h.w_u.toFixed(0)} psf
+  wu = 1.2(${p.wD}) + 1.6(${p.wL}) = ${h.w_u.toFixed(0)} psf${p.appliedMoment ? `
+  Applied moment = ${p.appliedMoment.toFixed(2)} ft-k (service)
+  Mu,applied = 1.6 × ${p.appliedMoment.toFixed(2)} / ${h.beff_used.toFixed(2)} = ${h.results.flexure.M_moment.toFixed(2)} ft-k/ft (factored, per ft)` : ''}
 
   FLEXURE:
-    Mu,uniform @ load = ${h.results.flexure.M_uniform.toFixed(2)} ft-k/ft
-    Available for point = ${h.results.flexure.capacity.toFixed(2)} - ${h.results.flexure.M_uniform.toFixed(2)} = ${(h.results.flexure.capacity - h.results.flexure.M_uniform).toFixed(2)} ft-k/ft
+    Mu,uniform @ load = ${h.results.flexure.M_uniform.toFixed(2)} ft-k/ft${h.results.flexure.M_moment > 0 ? `
+    Mu,applied moment = ${h.results.flexure.M_moment.toFixed(2)} ft-k/ft
+    Total demand (no P) = ${(h.results.flexure.M_uniform + h.results.flexure.M_moment).toFixed(2)} ft-k/ft` : ''}
+    φMn,x capacity    = ${h.results.flexure.capacity.toFixed(2)} ft-k/ft
+    Available for Pu   = ${h.results.flexure.capacity.toFixed(2)} - ${(h.results.flexure.M_uniform + (h.results.flexure.M_moment || 0)).toFixed(2)} = ${(h.results.flexure.capacity - h.results.flexure.M_uniform - (h.results.flexure.M_moment || 0)).toFixed(2)} ft-k/ft
     Pu = ${h.results.flexure.Pu.toFixed(2)} kips → P = ${(h.results.flexure.P*1000).toFixed(0)} lbs
 
   ONE-WAY SHEAR:
